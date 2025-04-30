@@ -80,49 +80,34 @@ class STGCNDataset(Dataset):
         label = torch.tensor(label, dtype=torch.long)
         return data, label
 
-def get_dataloaders(dataset_dir, batch_size=16, train_split=0.7, val_split=0.2, test_split=0.1, seed=42):
+def get_dataloaders(dataset_dir, batch_size=16, train_split=0.8, val_split=0.2, seed=42):
     """
-    Creates stratified train, validation, and test DataLoader objects for the STGCN dataset.
-    
+    Creates stratified train and validation DataLoaders (80/20 split) for the STGCN dataset.
+
     Parameters:
       - dataset_dir: directory where the .npy files are stored.
       - batch_size: batch size for the loaders.
-      - train_split, val_split, test_split: fractions that sum to 1.
+      - train_split, val_split: fractions that sum to 1 (default 0.8 and 0.2).
       - seed: random seed for reproducible splits.
-      
+
     Returns:
-      - train_loader, val_loader, test_loader
+      - train_loader, val_loader
     """
     full_dataset = STGCNDataset(dataset_dir)
-    dataset_length = len(full_dataset)
     labels = np.array(full_dataset.labels)
-    indices = np.arange(dataset_length)
-    
-    # first split: split off the test set
-    sss_test = StratifiedShuffleSplit(n_splits=1, test_size=test_split, random_state=seed)
-    for train_val_idx, test_idx in sss_test.split(indices, labels):
-        break  # Only one split is needed.
-    
-    # second split: from train_val, split into train and validation
-    # The relative val size (as a fraction of train+val) is:
-    rel_val_size = val_split / (train_split + val_split)
-    sss_val = StratifiedShuffleSplit(n_splits=1, test_size=rel_val_size, random_state=seed)
-    train_val_labels = labels[train_val_idx]
-    for train_idx_rel, val_idx_rel in sss_val.split(train_val_idx, train_val_labels):
-         break
-    # map the relative indices back to the original indices.
-    train_indices = train_val_idx[train_idx_rel]
-    val_indices = train_val_idx[val_idx_rel]
-    
-    train_dataset = Subset(full_dataset, train_indices)
-    val_dataset = Subset(full_dataset, val_indices)
-    test_dataset = Subset(full_dataset, test_idx)
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-    
-    return train_loader, val_loader, test_loader
+    indices = np.arange(len(full_dataset))
+
+    # stratified split
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=val_split, random_state=seed)
+    train_idx, val_idx = next(sss.split(indices, labels))
+
+    train_dataset = Subset(full_dataset, train_idx)
+    val_dataset   = Subset(full_dataset, val_idx)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=4)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=4)
+
+    return train_loader, val_loader
 
 def print_class_distribution(dataset, dataset_name="Dataset"):
 
@@ -140,7 +125,7 @@ def print_class_distribution(dataset, dataset_name="Dataset"):
 if __name__ == "__main__":
     dataset_root = os.path.join(os.getcwd(), "npydataset")
     
-    train_loader, val_loader, test_loader = get_dataloaders(dataset_root, batch_size=16)
+    train_loader, val_loader = get_dataloaders(dataset_root, batch_size=16)
     
     train_indices = train_loader.dataset.indices
     train_labels = [train_loader.dataset.dataset.labels[i] for i in train_indices]
@@ -150,14 +135,9 @@ if __name__ == "__main__":
     val_labels = [val_loader.dataset.dataset.labels[i] for i in val_indices]
     val_count_labels = len(val_labels)
 
-    test_indices = test_loader.dataset.indices
-    test_labels = [test_loader.dataset.dataset.labels[i] for i in test_indices]
-    test_count_labels = len(test_labels)
-
-    total_count_labels = train_count_labels + val_count_labels + test_count_labels
-
+    total_count_labels = train_count_labels + val_count_labels
     print("===== DataLoader Test =====")
-    print(f"Total Samples: {len(train_loader.dataset) + len(val_loader.dataset) + len(test_loader.dataset)}")
+    print(f"Total Samples: {len(train_loader.dataset) + len(val_loader.dataset)}")
     print(f"Total Labels (from split indices): {total_count_labels}")
 
     print(f"Training samples: {len(train_loader.dataset)}")
@@ -165,13 +145,9 @@ if __name__ == "__main__":
 
     print(f"Validation samples: {len(val_loader.dataset)}")
     print(f"Validation Labels: {val_count_labels}")
-
-    print(f"Test samples: {len(test_loader.dataset)}")
-    print(f"Test Labels: {test_count_labels}")
     
     print_class_distribution(train_loader.dataset, "Training Set")
     print_class_distribution(val_loader.dataset, "Validation Set")
-    print_class_distribution(test_loader.dataset, "Test Set")
     
     for data, labels in train_loader:
         print("data shape:", data.shape)

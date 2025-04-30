@@ -1,31 +1,13 @@
-"""
-stgcn.py
-
-A PyTorch implementation of the Spatio-Temporal Graph Convolutional Network (STGCN)
-with an adaptive graph convolutional layer as described in:
-
-  A Spatio-Temporal Graph Convolutional Network Model for Internet of Medical Things (IoMT)
-  Ghosh, D.K.; Chakrabarty, A.; Moon, H.; Piran, M.J.
-  Sensors 2022, 22, 8438. https://doi.org/10.3390/s22218438
-
-and its adaptive graph convolution design inspired by:
-
-  Two-Stream Adaptive Graph Convolutional Networks for Skeleton-Based Action Recognition
-  Shi, L.; Zhang, Y.; Cheng, J.; Lu, H.
-  CVPR 2019.
-
-The model assumes input skeleton data of shape (B, 3, 300, 25) (3 coordinates, 300 frames, 25 joints).
-"""
-
+from collections import deque
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 # ---------------------------
-# Adaptive Graph Convolutional Layer
+# skeleton graph representation
 # ---------------------------
-def build_ntu_rgbd_adjacency(num_joints=25):
+def build_ntu_rgbd_matrix():
     """
     Build the fixed physical adjacency matrix for the NTU RGB+D dataset.
         
@@ -56,8 +38,7 @@ def build_ntu_rgbd_adjacency(num_joints=25):
       23: Hand Tip Right
       24: Thumb Right
     """
-    # Define the list of edges (zero-indexed)
-    edges = [
+    return [
         (0, 1),    # Spine Base - Spine
         (1, 20),   # Spine - Spine Shoulder
         (20, 2),   # Spine Shoulder - Neck
@@ -89,76 +70,90 @@ def build_ntu_rgbd_adjacency(num_joints=25):
         (11, 24)   # Hand Right - Thumb Right
     ]
     
+# ---------------------------
+# Ak representation Ak = Λk−^(1/2) Ak¯ Λk−^(1/2)
+# ---------------------------
+
+def build_partitioned_adjacency(num_joints, edge_list, root=0, alpha=0.001):
+    # build raw symmetric adjacency matrix
     A = np.zeros((num_joints, num_joints), dtype=np.float32)
-    for i, j in edges:
+    for i, j in edge_list:
         A[i, j] = 1
         A[j, i] = 1
-    # Add self-connections.
+
+    # compute shortest path distance from each node to the root
+    dist = [np.inf] * num_joints
+    dist[root] = 0
+    q = deque([root])
+    while q:
+        v = q.popleft()
+        for u in range(num_joints):
+            if A[v, u] and dist[u] == np.inf:
+                dist[u] = dist[v] + 1
+                q.append(u)
+    dist = np.array(dist, dtype=np.int32)
+
+    # init the three raw partitions Abar_k
+    Abar = np.zeros((3, num_joints, num_joints), dtype=np.float32)
+    # self connections k=0
     for i in range(num_joints):
-        A[i, i] = 1
-    return torch.tensor(A)
+        Abar[0, i, i] = 1
+    # inward edges (j one hop closer to root than i) -> k=1
+    # outward edges (j one hop further from root than i) -> k=2
+    for i in range(num_joints):
+        for j in range(num_joints):
+            if A[i, j] == 1:
+                if dist[j] == dist[i] - 1:
+                    Abar[1, i, j] = 1
+                elif dist[j] == dist[i] + 1:
+                    Abar[2, i, j] = 1
+
+    # symmetric normalization
+    A = np.zeros_like(Abar)
+    for k in range(3):
+        Ak = Abar[k]
+        D = np.sum(Ak, axis=1) + alpha
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(D))
+        # normalized: D^{-1/2} A_k D^{-1/2}
+        A[k] = D_inv_sqrt @ Ak @ D_inv_sqrt
+
+    return torch.from_numpy(A)  # shape (3, N, N)
+
 
 # ---------------------------
-# Adaptive Graph Convolutional Layer
+# adaptive graph convolutional layer
 # ---------------------------
 class AdaptiveGraphConv(nn.Module):
     def __init__(self, in_channels, out_channels, num_joints, 
                  kernel_size=3, embed_channels=None, A=None, residual=True):
-        """
-        Adaptive Graph Convolutional Layer exactly as described in the paper.
-        
-        Implements:
-            f_out = sum_{k=1}^{K_v} W_k [ f_in * (A_k + B_k + C_k) ]
-        where:
-          - K_v (kernel_size) is the number of partitions (typically 3).
-          - A_k: fixed physical adjacency for partition k.
-          - B_k: learnable adjacency tensor of shape (K_v, num_joints, num_joints),
-                 initialized to zero.
-          - C_k: data-dependent adjacency computed using a normalized embedded Gaussian
-                 function via two embeddings θ and φ.
-          - W_k: realized as a 1×1 convolution applied after aggregation.
-          - A residual connection is applied (with a 1×1 conv if needed).
-          
-        Args:
-          in_channels: Number of input channels.
-          out_channels: Number of output channels.
-          num_joints: Number of joints (vertices), e.g., 25.
-          kernel_size: Number of partitions K_v; typically 3.
-          embed_channels: Embedding dimension (if None, defaults to max(in_channels // 2, 1)).
-          A: Fixed physical adjacency tensor of shape (num_joints, num_joints).  
-             If None, defaults to an identity matrix repeated kernel_size times.
-          residual: Whether to use a residual connection.
-        """
         super(AdaptiveGraphConv, self).__init__()
         self.num_joints = num_joints
         self.K_v = kernel_size
         self.residual = residual
-        if embed_channels is None:
-            embed_channels = max(in_channels // 2, 1)
-        self.embed_channels = embed_channels
         
-        # Define embedding functions θ and φ (1×1 convolutions).
-        self.theta = nn.Conv2d(in_channels, embed_channels, kernel_size=1)
-        self.phi   = nn.Conv2d(in_channels, embed_channels, kernel_size=1)
+        # define embedding functions (1×1 conv).
+        self.theta = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.phi   = nn.Conv2d(in_channels, in_channels, kernel_size=1)
         
-        # Learnable parameter B_k: shape (K_v, num_joints, num_joints), initialized to zero.
+        # learnable parameter B_k, initialized to zero.
         self.B = nn.Parameter(torch.zeros(self.K_v, num_joints, num_joints), requires_grad=True)
-        A = build_ntu_rgbd_adjacency(num_joints=25)
 
-        # Fixed physical adjacency A_k: shape (K_v, num_joints, num_joints)
-        if A is None:
-            # If not provided, default to identity for each partition.
-            print("A is none")
-            A = torch.eye(num_joints).unsqueeze(0).repeat(self.K_v, 1, 1)
-        else:
-            # print("else")
-            if A.dim() == 2:
-                A = A.unsqueeze(0).repeat(self.K_v, 1, 1)
-        self.register_buffer('A', A)
-        # 1×1 convolution to represent the weighting function W.
-        self.conv1x1 = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        edges = build_ntu_rgbd_matrix()
+        # normalized partitions
+        A_partitioned = build_partitioned_adjacency(
+            num_joints=num_joints,
+            edge_list=edges,
+            root=0,
+            alpha= 0.001
+        )
+        self.register_buffer('A', A_partitioned)
+        # W_k per partition
+        self.convs = nn.ModuleList([
+            nn.Conv2d(in_channels, out_channels, kernel_size=1)
+            for _ in range(self.K_v)
+        ])
         
-        # Residual connection: if the input and output channels differ, apply a 1x1 conv.
+        # residual connection. if the input and output channels differ, apply a 1x1 conv.
         if self.residual:
             if in_channels != out_channels:
                 self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
@@ -174,47 +169,48 @@ class AdaptiveGraphConv(nn.Module):
         # x has shape: (B, C_in, T, N)
         BATCH, C, T, N = x.size()
         
-        # Compute the embeddings.
-        # f_theta and f_phi: (B, embed_channels, T, N)
         f_theta = self.theta(x)
         f_phi   = self.phi(x)
         
-        # Permute so that the joint dimension (N) comes next: (B, N, embed_channels, T)
+        # Permute so that the joint dimension (N) comes next (B, N, embed channels, T)
         f_theta = f_theta.permute(0, 3, 1, 2).contiguous()
         f_phi   = f_phi.permute(0, 3, 1, 2).contiguous()
-        # Flatten the last two dimensions: shape (B, N, embed_channels * T)
+        # flatten the last two dimensions (B, N, embed_channels * T)
         f_theta_flat = f_theta.view(BATCH, N, -1)
         f_phi_flat   = f_phi.view(BATCH, N, -1)
         
-        # Compute the data-dependent component using the dot product and softmax.
-        C_adapt = torch.bmm(f_theta_flat, f_phi_flat.transpose(1, 2))  # (B, N, N)
+        # compute the data dependent component using the dot product and softmax.
+        C_adapt = torch.bmm(f_theta_flat, f_phi_flat.transpose(1, 2))
         C_adapt = F.softmax(C_adapt, dim=-1)
-        # Replicate C_adapt over K_v partitions: shape (B, K_v, N, N)
+        # replicate C adapt over K_v partitions (B, K_v, N, N)
         C_k = C_adapt.unsqueeze(1).expand(BATCH, self.K_v, N, N)
         
-        # Combine the fixed physical graph A_k and learnable B_k.
-        # Both have shape (K_v, N, N).
-        A_combined = self.A + self.B  # (K_v, N, N)
-        A_combined = A_combined.unsqueeze(0)  # (1, K_v, N, N)
+        # combine the fixed physical graph A_k and learnable B_k.
+        A_combined = self.A + self.B
+        A_combined = A_combined.unsqueeze(0)
         
-        # Form the final adaptive adjacency by adding the data-dependent component.
+        # form final adaptive adjacency by adding the data dependent component
         # Adaptive_adj: (B, K_v, N, N)
         Adaptive_adj = A_combined + C_k
         
-        # Expand x to have a partition dimension:
-        # x: (B, C, T, N) -> (B, 1, C, T, N) -> (B, K_v, C, T, N)
+        # expand x to have a partition dimension:
+        # (B, C, T, N) -> (B, 1, C, T, N) -> (B, K_v, C, T, N)
         x_expanded = x.unsqueeze(1).expand(BATCH, self.K_v, C, T, N)
         
-        # Aggregate the features via the adaptive adjacency matrix using Einstein summation.
-        # x_aggregated[b, k, c, t, m] = sum_{n} x[b, k, c, t, n] * Adaptive_adj[b, k, n, m]
+        # aggregate the features via the adaptive adjacency matrix using Einstein summation
+        # x_aggregated[b, k, c, t, m] = sum_{n} x[b, k, c, t, n] * adaptive_adj[b, k, n, m]
         x_aggregated = torch.einsum('bkcTN,bkNM->bkcTM', x_expanded, Adaptive_adj)
-        # Sum over the partition dimension.
-        x_sum = torch.sum(x_aggregated, dim=1)  # shape: (B, C, T, N)
+        # sum over the partition dimension.
         
-        # Apply the 1×1 convolution (weighting function).
-        out = self.conv1x1(x_sum)
+        # apply 1×1 conv (weighting function).
+        # new: apply each W_k before summing
+        out = 0
+        for k, conv in enumerate(self.convs):
+            # x_agg_k is the aggregated features for partition k
+            out = out + conv(x_aggregated[:, k])
+        # now out has shape (B, out channels, T, N)
         
-        # Add the residual connection.
+        # add the residual connection
         if self.residual:
             res = x if self.residual_conv is None else self.residual_conv(x)
             out = out + res
@@ -224,7 +220,7 @@ class AdaptiveGraphConv(nn.Module):
         return out
 
 # ---------------------------
-# Temporal Convolution
+# temporal convolution
 # ---------------------------
 class TemporalConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=9):
@@ -232,27 +228,32 @@ class TemporalConv(nn.Module):
         self.conv = nn.Conv2d(in_channels, out_channels,
                               kernel_size=(kernel_size, 1),
                               padding=(kernel_size // 2, 0))
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
     def forward(self, x):
-        return self.conv(x)
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        return x
 
 # ---------------------------
-# STGCN Block with Adaptive Spatial GCN
+# STGCN block
 # ---------------------------
 class STGCNBlock(nn.Module):
     def __init__(self, in_channels, out_channels, num_joints=25,
                  spatial_kernel_size=3, temporal_kernel_size=9, residual=True):
         super(STGCNBlock, self).__init__()
-        # Adaptive Graph Convolution (Spatial branch)
+        # adaptive graph conv
         self.adaptive_spatial = AdaptiveGraphConv(in_channels, out_channels,
                                                     num_joints=num_joints,
                                                     kernel_size=spatial_kernel_size,
                                                     residual=residual)
-        # Temporal Convolution branch
+        # temporal conv
         self.temporal_conv = TemporalConv(in_channels, out_channels,
                                           kernel_size=temporal_kernel_size)
-        # Fuse branches: concatenate along channel dimension then reduce with 1x1 conv.
+        # fuse branches. concat along channel dimension then reduce with 1x1 conv
         self.fuse_conv = nn.Conv2d(2 * out_channels, out_channels, kernel_size=1)
-        # Residual connection across the block (if input dims differ, adjust)
+        # residual connection across the block (if input dims differ, adjust)
         if residual:
             if in_channels != out_channels:
                 self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
@@ -261,39 +262,35 @@ class STGCNBlock(nn.Module):
         else:
             self.residual_conv = None
         self.bn = nn.BatchNorm2d(out_channels)
-        self.dropout = nn.Dropout(p=0.5)
 
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        # x shape: (B, C, T, N)
-        spatial_out = self.adaptive_spatial(x)   # (B, out_channels, T, N)
-        temporal_out = self.temporal_conv(x)       # (B, out_channels, T, N)
-        # Concatenate along channels
-        cat = torch.cat([spatial_out, temporal_out], dim=1)  # (B, 2*out_channels, T, N)
-        fused = self.fuse_conv(cat)  # (B, out_channels, T, N)
-        # Residual connection
+        spatial_out = self.adaptive_spatial(x)
+        temporal_out = self.temporal_conv(x)
+        # concat along channels
+        cat = torch.cat([spatial_out, temporal_out], dim=1)
+        fused = self.fuse_conv(cat)
+        # residual connection
         if self.residual_conv is not None:
             res = self.residual_conv(x)
         else:
             res = x
         out = fused + res
         out = self.bn(out)
-        out = self.dropout(out)
         out = self.relu(out)
 
         return out
 
 # ---------------------------
-# Full STGCN Model
+# full STGCN model
 # ---------------------------
 class STGCN(nn.Module):
     def __init__(self, num_classes, num_joints=25, num_frames=300):
         super(STGCN, self).__init__()
-        # Input BatchNorm on raw data (3 channels)
+        # batchNorm
         self.input_bn = nn.BatchNorm2d(3)
-        # Define blocks (adapt the channel progression from the paper)
-        # According to the paper: first 4 blocks: 64 channels, next 3 blocks: 128 channels, last 3: 256 channels.
+        # define blocks
         self.blocks = nn.ModuleList()
         layers = [(3, 64), (64, 64), (64, 64), (64, 64),
                   (64, 128), (128, 128), (128, 128),
@@ -306,23 +303,21 @@ class STGCN(nn.Module):
                            temporal_kernel_size=9,
                            residual=True)
             )
-        # Global average pooling over temporal and joint dimensions
+        # global average pooling over temporal and joint dimensions
         self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-        # Final fully-connected layer: input channels = output of last block.
+        # fc
         self.fc = nn.Linear(layers[-1][1], num_classes)
 
     def forward(self, x):
-        # x shape: (B, 3, T, N) - expected T = num_frames (e.g., 300) and N = num_joints (25)
         x = self.input_bn(x)
         for block in self.blocks:
             x = block(x)
-        # Global average pooling over T and N
-        x = self.global_avg_pool(x)  # (B, C, 1, 1)
-        x = x.view(x.size(0), -1)     # (B, C)
-        out = self.fc(x)              # (B, num_classes)
+        x = self.global_avg_pool(x)
+        x = x.view(x.size(0), -1)
+        out = self.fc(x)
         return out
 
- # test
+ # test with dummy input to see if working
 if __name__ == "__main__":
     model = STGCN(num_classes=60, num_joints=25, num_frames=300)
     dummy_input = torch.randn(8, 3, 300, 25)

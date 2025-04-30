@@ -65,8 +65,8 @@ def validate_epoch(model, loader, criterion):
 
 def train_model(model, train_loader, val_loader, num_epochs=50):
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4, nesterov=True)
-    scheduler = MultiStepLR(optimizer, milestones=[10, 20, 30, 40], gamma=0.1)
+    optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4, nesterov=True)
+    scheduler = MultiStepLR(optimizer, milestones=[ 30, 40], gamma=0.1)
 
     best_val_acc = 0.0
 
@@ -80,7 +80,7 @@ def train_model(model, train_loader, val_loader, num_epochs=50):
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), "best_stgcn_model2.pth")
+            torch.save(model.state_dict(), "best_stgcn_model_49c.pth")
             print("-> Best model saved.")
         print("-" * 40)
 
@@ -89,7 +89,7 @@ def train_model(model, train_loader, val_loader, num_epochs=50):
 
     print(f"Training complete. Best validation accuracy: {best_val_acc:.4f}")
 
-    with open("trainresults.csv", "w", newline="") as f:
+    with open("trainresults_remake.csv", "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["Epoch", "Train Loss", "Train Acc", "Val Loss", "Val Acc", "Epoch Time (s)"])
         writer.writerows(epoch_results)
@@ -98,25 +98,12 @@ def main():
     dataset_dir = os.path.join(os.getcwd(), "npydataset")
     batch_size = 16
 
-    train_loader, val_loader, test_loader = get_dataloaders(dataset_dir, batch_size=batch_size)
+    train_loader, val_loader = get_dataloaders(dataset_dir, batch_size=batch_size)
 
-    model = STGCN(num_classes=50, num_joints=25, num_frames=300).to(device)
+    model = STGCN(num_classes=49, num_joints=25, num_frames=300).to(device)
 
     train_model(model, train_loader, val_loader, num_epochs=50)
 
-    model.eval()
-    total_correct = 0
-    total_samples = 0
-    with torch.no_grad():
-        for data, labels in test_loader:
-            inputs = data.to(device)
-            labels = labels.to(device)
-            outputs = model(inputs)
-            _, predicted = torch.max(outputs, 1)
-            total_correct += (predicted == labels).sum().item()
-            total_samples += labels.size(0)
-    test_acc = total_correct / total_samples
-    print(f"Test Accuracy: {test_acc:.4f}")
 
 if __name__ == "__main__":
     main()

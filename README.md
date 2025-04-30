@@ -24,7 +24,7 @@ python .\txt2npy.py
 ## Once dataset is downloaded and converted to .npy:
 ### Count the samples in the dataset
 ```bash
-python .\ciybt_samples.py
+python .\count_samples.py
 ```
 
 ### Count samples produced by the dataloader

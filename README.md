@@ -1,7 +1,7 @@
 
 # Spatial-Temporal Graph Convolution Network
 ## Overview
-This is my final project for [Edge and Neuromorphic Computing class](https://cse.sc.edu/class/714) where I implemented [A Spatio-Temporal Graph Convolutional Network Model for Internet of Medical Things (IoMT)](https://www.mdpi.com/1424-8220/22/21/84386) architecture for classifying human activity recognition 3D skeletal dataset into 49 different categories from The [NTU RGB+D](https://rose1.ntu.edu.sg/dataset/actionRecognition/) dataset. 
+This is my final project for [Edge and Neuromorphic Computing class](https://cse.sc.edu/class/714) where I implemented [A Spatio-Temporal Graph Convolutional Network Model for Internet of Medical Things (IoMT)](https://www.mdpi.com/1424-8220/22/21/8438) architecture for classifying human activity recognition 3D skeletal dataset into 49 different categories from The [NTU RGB+D](https://rose1.ntu.edu.sg/dataset/actionRecognition/) dataset. 
 Please see my [Final Report](https://github.com/markshperkin/HAR-STGCN/blob/master/report/final%20report.pdf) for more information.
 ---
 ## how to run:
